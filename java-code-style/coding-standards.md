@@ -385,6 +385,195 @@ continuation indent — do not manually split `@Parameter` and `@RequestParam` o
 
 ---
 
+## 12. `@Transactional` must be proxy-reachable; never on a self-invoked or private method
+
+Spring's `@Transactional` is implemented by a **proxy** that wraps the bean. The annotation only
+takes effect when the method is (a) `public` and (b) called **from outside the bean** so the call
+passes through the proxy. Two structures silently disable it — the annotation is ignored, no
+transaction opens, and the code looks correct while running in autocommit:
+
+- **`private` (or non-public) `@Transactional` method** — the proxy cannot intercept it.
+- **Self-invocation** — one method calling another on the same bean via `this`; the call never
+  re-enters the proxy.
+
+When you need an atomic unit that must exclude some work (e.g. a slow BCrypt verify) from the
+transaction, do **not** extract it into a private `@Transactional` helper called from the same bean.
+Use one of:
+1. **`TransactionTemplate`** — open the transaction programmatically, exactly where the writes are.
+   Immune to the proxy pitfalls; the boundary is explicit and cannot be defeated by a later refactor.
+2. **A separate `@Service` bean** holding the `public @Transactional` method, injected and called
+   across the bean boundary (so the call is proxied).
+
+Also: declare `@Transactional` on **any** method whose own body does a lock-then-write or multiple
+writes that must commit together — atomicity is a property the method guarantees about itself, not a
+hope about its callers. With the default `REQUIRED` propagation it joins a caller's transaction when
+one exists and opens its own when one does not, so the declaration is free when nested and essential
+when called directly. (Reinforces P3C Exception rule 5 — rollback happens by exception propagation
+out of the proxied boundary.)
+
+```java
+// BAD — @Transactional on a private method called via this: the proxy is bypassed, NO transaction
+// opens, and a failed placeHold leaves an orphaned order row in autocommit.
+public OrderDTO placeOrder(long memberId, PlaceOrderCommand cmd) {
+    passwordService.verify(memberId, cmd.password());   // slow BCrypt, kept outside the tx
+    return placeOrderTransactional(memberId, cmd);       // self-invocation → annotation inert
+}
+
+@Transactional(rollbackFor = Exception.class)
+private OrderDTO placeOrderTransactional(long memberId, PlaceOrderCommand cmd) {
+    long id = orderRepository.insert(...);               // write 1
+    accountingService.placeHold(memberId, cmd.amount(), id);  // write 2 — NOT atomic with write 1
+    return OrderConverter.toDto(orderRepository.findById(id));
+}
+
+// GOOD — TransactionTemplate opens the transaction at the call site; BCrypt runs before the first
+// SQL so it never holds a connection. The two writes commit or roll back together.
+public OrderDTO placeOrder(long memberId, PlaceOrderCommand cmd) {
+    // validate / init ...
+    passwordService.verify(memberId, cmd.password());
+
+    return transactionTemplate.execute(status -> {
+        long id = orderRepository.insert(...);
+        accountingService.placeHold(memberId, cmd.amount(), id);  // joins this tx (REQUIRED)
+        return OrderConverter.toDto(orderRepository.findById(id));
+    });
+}
+```
+
+**Red flags — the annotation is probably inert:** `@Transactional` on a `private`/`protected`
+method; a `this.someTransactionalMethod(...)` call within the same class; a `@Transactional` method
+that "fixes" atomicity but the orphaned-row bug still reproduces.
+
+### Keep the transaction scope minimal — never wrap slow or external work
+
+A transaction holds a pooled DB connection (and any row locks) for its **entire** duration. The
+longer it stays open, the longer locks block other writers and the longer the connection is
+unavailable to the pool — under load this causes lock contention and connection-pool starvation.
+So the transaction must wrap **only** the database writes that must commit atomically, and nothing
+else. Keep these **outside** the boundary:
+
+- Slow CPU work — BCrypt/hashing, serialization, large in-memory transforms.
+- Any network or external I/O — HTTP/RPC calls, message publishing, S3/file uploads, sending email.
+- Input validation, order-number generation, DTO mapping, and read-backs that don't need to be in
+  the same atomic unit.
+
+Compute everything you can **before** opening the transaction, do the writes, and map/return
+**after** it commits. This is also *why* the patterns above (a narrow `TransactionTemplate.execute`
+block, or a small focused `@Transactional` method) are preferred over annotating a large
+orchestration method: a method-level `@Transactional` silently pulls every line of the method —
+including any slow or remote call — inside the boundary.
+
+```java
+// BAD — a slow HTTP call and BCrypt both run while the transaction (and its connection) is open.
+@Transactional(rollbackFor = Exception.class)
+public OrderDTO placeOrder(long memberId, PlaceOrderCommand cmd) {
+    passwordService.verify(memberId, cmd.password());          // ~100ms BCrypt — holds a connection
+    FxRate rate = fxClient.fetchRate(cmd.currency());          // network I/O — holds a connection
+    long id = orderRepository.insert(toOrder(cmd, rate));
+    accountingService.placeHold(memberId, cmd.amount(), id);
+    return OrderConverter.toDto(orderRepository.findById(id));
+}
+
+// GOOD — slow + remote work happens first; the tx wraps only the two writes.
+public OrderDTO placeOrder(long memberId, PlaceOrderCommand cmd) {
+    passwordService.verify(memberId, cmd.password());          // outside the tx
+    FxRate rate = fxClient.fetchRate(cmd.currency());          // outside the tx
+    Order toInsert = toOrder(cmd, rate);                       // prepared outside the tx
+
+    long id = transactionTemplate.execute(status -> {
+        long orderId = orderRepository.insert(toInsert);
+        accountingService.placeHold(memberId, cmd.amount(), orderId);
+        return orderId;
+    });
+
+    return OrderConverter.toDto(orderRepository.findById(id)); // read-back after commit
+}
+```
+
+If a remote call genuinely must be coordinated with the DB write (e.g. call a payment gateway then
+record the result), do **not** hold a transaction across the call — use a saga / outbox / compensating
+action instead. A transaction is not the tool for cross-system consistency.
+
+---
+
+## 13. Document the lock → compare → update pattern on balance/row mutations
+
+Any method that does a pessimistic read-modify-write (`SELECT … FOR UPDATE`, check the locked
+state, then write) must label the three steps in comments, so the concurrency contract is visible
+without reverse-engineering it. The lock is held across all three steps inside one transaction; the
+update releases it on commit.
+
+```java
+// GOOD — each phase is named; a reader sees the lock is held across check-and-write
+@Transactional(rollbackFor = Exception.class)
+public void debitWithHoldRelease(long memberId, String currency, BigDecimal amount, ...) {
+    // 1. Lock: load the wallet row FOR UPDATE; the lock is held until commit.
+    Wallet w = walletRepository.findForUpdate(memberId, currency);
+    if (w == null) {
+        throw new ServiceException(WalletErrorCodes.INSUFFICIENT_FUNDS);
+    }
+
+    // 2. Compare: under the lock, reject if the post-debit balance would go negative.
+    BigDecimal balance = w.balance().subtract(amount);
+    if (balance.compareTo(ZERO) < 0) {
+        throw new ServiceException(WalletErrorCodes.INSUFFICIENT_FUNDS);
+    }
+
+    // 3. Update & release: persist the new balance + ledger entry; the lock releases on commit.
+    walletRepository.updateBalance(w.id(), balance);
+    walletLedgerRepository.insert(...);
+}
+```
+
+When a step is genuinely absent — e.g. a credit that only adds and can never go negative — say so
+(`// 2. Compare: none needed — a credit only adds`) rather than leaving a silent gap. The check
+must use `BigDecimal.compareTo`, never `equals` (P3C OOP rule 8).
+
+---
+
+## 14. Internalize variant dispatch; don't make callers pick the method
+
+When sibling operations differ only along an enum dimension, take that dimension as a **parameter**
+and branch on it **inside** the method. Do not expose one public method per variant — that leaks the
+dispatch to every caller, who must then re-derive which method to call, and makes the operations
+read as asymmetric when they are not.
+
+```java
+// BAD — caller must inspect the fund type and pick the method; the branch leaks upward
+if (order.fundType() == FundType.DEMO) {
+    accountingService.debitDemoWithHoldRelease(memberId, currency, amount, ...);
+} else {
+    accountingService.debitActualWithHoldRelease(memberId, currency, amount, ...);
+}
+
+// GOOD — one entry point takes the dimension; it dispatches to private helpers internally,
+// mirroring how the sibling credit(...) already internalises the same branch
+accountingService.debitWithHoldRelease(memberId, currency, amount, ..., order.fundType());
+```
+
+```java
+// inside the service: the public method owns the dispatch
+public void debitWithHoldRelease(..., FundType fundType) {
+    switch (fundType) {
+        case ACTUAL:
+            debitActual(...);   // private helper
+            break;
+        case DEMO:
+            debitDemo(...);     // private helper
+            break;
+        default:
+            throw new ServiceException(WalletErrorCodes.FUND_INVALID_TYPE);
+    }
+}
+```
+
+Keep sibling operations symmetric: if `credit(..., fundType)` hides the bucket choice, the matching
+`debit...(..., fundType)` should too. (Note: the P3C-PMD `SwitchStatementRule` only recognises
+classic colon-style `switch` with a `default:` — arrow-style `case X ->` / `default ->` is reported
+as a missing default, so use colon style for enum dispatch.)
+
+---
+
 ## Scope
 
 These rules apply to all files under `src/main/java` and `src/test/java`. They do not govern
