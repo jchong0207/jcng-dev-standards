@@ -1,12 +1,13 @@
 ---
 name: java-code-style
-description: Apply Java readability conventions when writing or reviewing Java code. Covers method body breathing room, named boolean conditions, cross-service call comments, private-method extraction, variable grouping, guard clauses, Optional returns, and method ordering. Triggers automatically alongside java-alibaba-standards for any Java work. Also invoke explicitly via /java-code-style.
+description: Apply Java readability conventions when writing or reviewing Java code. Covers method body breathing room, named boolean conditions, cross-service call comments, private-method extraction, variable grouping, guard clauses, Optional returns, method ordering, parameter alignment, service method section labels, and controller endpoint annotation formatting. Triggers automatically alongside java-alibaba-standards for any Java work. Also invoke explicitly via /java-code-style.
 ---
 
 # Java Code Style — Readability Conventions
 
-Canonical source (for crm-java-user): `docs/coding-standards.md`. Read that file for the full
-spec with before/after examples. The rules below are the enforcement checklist.
+Canonical source: `coding-standards.md` (co-located in this skill directory — shared across all
+consuming repos via the dev-standards submodule). Read that file for the full spec with
+before/after examples. The rules below are the enforcement checklist.
 
 ---
 
@@ -22,7 +23,7 @@ Trigger automatically (alongside `java-alibaba-standards`) when any of these are
 
 ## Rules checklist
 
-Read `docs/coding-standards.md` for full examples. Summary:
+Read `coding-standards.md` for full examples. Summary:
 
 ### Rule 1 — Blank lines around control-flow blocks
 Every `if`/`else`/`for`/`while`/`switch` must be preceded AND followed by a blank line, unless:
@@ -62,6 +63,26 @@ Declare in this order: `public` → `protected` → `private` helpers → `stati
 Related methods stay adjacent within each group. Static mappers (`toDto`, `toEntity`) always last.
 Extends P3C OOP rule 16 (which omits the static-mapper group).
 
+### Rule 9 — Method parameter alignment
+Keep all params on one line when the signature fits within 120 cols. When it overflows, let
+Spotless wrap — do not manually reformat. Never force each param onto its own line unless
+Spotless produces that output itself.
+
+### Rule 10 — Service method section labels
+Every public service method body must be structured into labelled sections:
+1. `// validate` — all `Assert.*` / guard checks on incoming parameters
+2. `// init` — local variable declarations and setup derived from parameters
+3. Business logic steps — each cross-service call preceded by its own descriptive `//` comment (Rule 3)
+
+Each section separated by a blank line. Omit a label only if the section is absent.
+
+### Rule 11 — Controller endpoint annotation formatting
+`@Operation`: `summary` on the same line, `description` on continuation only when overflow.
+`@io.swagger...ApiResponse`: same — `responseCode` on same line, `description` on continuation.
+`@Parameter` + binding annotation (`@PathVariable`, `@RequestParam`): keep together on one line
+when they fit; let Spotless wrap `@RequestParam(...)` to continuation when overflow. Never
+manually split them onto separate lines.
+
 ---
 
 ## Priority
@@ -77,7 +98,7 @@ Extends P3C OOP rule 16 (which omits the static-mapper group).
 ## Generation mode behaviour
 
 When writing new code:
-1. Apply all 8 rules proactively — do not wait to be asked.
+1. Apply all 11 rules proactively — do not wait to be asked.
 2. If a method body exceeds ~15 lines without a blank line, that is a signal Rule 1 or Rule 4 is
    being violated.
 3. Any `.service(...)`, `.repository(...)`, `.findXxx(...)`, `.getXxx(...)` call on an injected
@@ -86,6 +107,12 @@ When writing new code:
    possible — Rule 7. A `null` return from a public method is always a violation.
 5. When writing a new class, lay out methods in Rule 8 order from the start; do not append to the
    bottom of the file without checking position.
+6. Keep method params on one line when the signature fits in 120 cols — Rule 9. Let Spotless own
+   the wrapping on overflow; never hand-split a signature that could fit.
+7. Every public service method gets `// validate`, `// init`, and labelled business-logic sections
+   from the start — Rule 10. Write the labels as you go, not as an afterthought.
+8. On controller endpoints, lay out `@Operation` / `@ApiResponse` / `@Parameter` per Rule 11; let
+   Spotless wrap on overflow, never hand-split annotations that fit.
 
 ## Review mode behaviour
 
